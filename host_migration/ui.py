@@ -26,6 +26,10 @@ PAGE = """<!doctype html>
         border:1px solid #445;cursor:pointer}
  #result{margin-top:8px;padding:8px;border:1px solid #2a4a2a;white-space:pre-wrap}
  #events{margin-top:8px;color:#9ab;max-height:180px;overflow:auto}
+ #audit{margin-top:8px;color:#9ab;max-height:220px;overflow:auto}
+ table{border-collapse:collapse;font-size:12px}
+ td,th{border:1px solid #334;padding:1px 6px;text-align:left}
+ .migrated{color:#8f8}.resent{color:#fc8}.dropped{color:#f88}
  .err{color:#f88}.ok{color:#8f8}
 </style></head><body>
 <div id=head>
@@ -42,10 +46,14 @@ PAGE = """<!doctype html>
  <button onclick=act('move_right')>move &rarr;</button>
  <button onclick=act('stop')>stop</button>
  <button onclick=act('press')>press button (5-tick action)</button>
- <button onclick=act('handoff')>graceful handoff (host)</button>
+ <button onclick=act('pickup')>pick up item</button>
+ <button onclick=act('handoff_log')>handoff (revocable log)</button>
+ <button onclick=act('handoff_frozen')>handoff (frozen once)</button>
+ <button onclick=act('exit')>voluntary exit (host)</button>
  <button onclick=crash()>simulate host crash</button>
 </div>
 <div id=result></div>
+<div id=audit></div>
 <div id=events></div>
 <script>
 async function act(a){
@@ -106,9 +114,39 @@ async function poll(){
     '  hash_ok='+c.hash_ok+'  entities='+c.entities+'  replayed_inputs='+c.replayed_inputs+
     '  ('+c.reason+')';
   }
+  if(s.handoff){
+   const h=s.handoff;
+   out+='\\nHANDOFF#'+h.id+' ['+h.strategy+'] stage='+h.stage+
+    ' epoch '+h.from_epoch+'->'+h.to_epoch+'  boundary tick '+h.boundary_tick+
+    '  publish_count='+h.publish_count+'\\n'+
+    '  confirmed boundary: '+JSON.stringify(h.confirmed)+
+    '  unconfirmed: '+JSON.stringify((h.unconfirmed||[]).map(u=>u.cid+':'+u.seq))+
+    '  carry='+h.carry_unconfirmed+'\\n'+
+    '  candidates '+JSON.stringify(h.candidates)+'  rejected '+JSON.stringify(h.rejected);
+   for(const st of (h.steps||[]))
+    out+='\\n   stage '+st.stage+' :: '+st.note;
+  }
+  const inv=s.inventory||{};
+  out+='\\nITEMS created='+s.items_created+'  '+Object.keys(inv).map(k=>k+'=['+inv[k].join(',')+']').join('  ');
+  if(s.handoff_log && s.handoff_log.length){
+   out+='\\nHANDOFF LOG (retained):';
+   for(const a of s.handoff_log)
+    out+='\\n  #'+a.id+' '+a.strategy+' -> '+a.candidate+
+     ' rejected='+JSON.stringify(a.rejected)+' stage='+a.stage+
+     ' publishes='+a.publish_count+(a.done?' (done)':' (open)');
+  }
   const noteEl=document.getElementById('result');
   if(noteEl.dataset.note){out=noteEl.dataset.note+'\\n\\n'+out;noteEl.dataset.note='';}
   if(out) result.textContent=out;
+  const rows=(s.input_log||[]).slice().reverse().map(e=>{
+   const src=e.source==='migrated'?'migrated':(e.source==='client_resend'?'resent':'direct');
+   const st=e.status==='applied'?'ok':(e.status==='dropped_duplicate'?'dropped':'');
+   return '<tr class='+st+'><td>'+e.epoch+'</td><td>'+e.host+'</td>'+
+    '<td>'+e.cid+'</td><td>'+e.seq+'</td><td>'+e.action+'</td>'+
+    '<td>'+e.status+'</td><td class='+src+'>'+e.source+'</td><td>'+
+    (e.boundary_tick==null?'-':e.boundary_tick)+'</td></tr>';}).join('');
+  audit.innerHTML='<table><tr><th>ep</th><th>host</th><th>player</th><th>seq</th>'+
+   '<th>action</th><th>status</th><th>source</th><th>boundary</th></tr>'+rows+'</table>';
   events.innerHTML=s.events.map(e=>{
    const cl=e.kind==='error'?'err':(e.kind==='migrate'?'ok':'');
    return '<div class='+cl+'>['+e.kind+'] '+e.msg+'</div>';}).join('');

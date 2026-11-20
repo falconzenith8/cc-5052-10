@@ -39,6 +39,10 @@ class World:
         self.gear = {"id": "gear1", "x": 420.0, "y": 60.0,
                      "angle": 0.0, "speed": 3.0}
         self.press_count = 0  # makes double-execution of inputs visible
+        # item ownership: player id -> [item id]; item ids embed (pid, seq)
+        # so a replayed input is idempotent and leaves a single item.
+        self.inventory: dict[str, list[str]] = {}
+        self.items_created = 0
 
     @classmethod
     def genesis(cls, session_id: str) -> "World":
@@ -47,13 +51,15 @@ class World:
     def add_player(self, pid: str) -> None:
         if pid not in self.players:
             self.players[pid] = _player(pid, len(self.players))
+            self.inventory.setdefault(pid, [])
 
     def remove_player(self, pid: str) -> None:
         self.players.pop(pid, None)
+        self.inventory.pop(pid, None)
 
     # ---- simulation -----------------------------------------------------
 
-    def apply_input(self, pid: str, action: str) -> None:
+    def apply_input(self, pid: str, action: str, seq: int = 0) -> None:
         p = self.players.get(pid)
         if p is None:
             return
@@ -68,6 +74,14 @@ class World:
         elif action == "press":
             p["action"] = {"kind": "press", "remaining": 5}
             p["vx"] = 0.0
+        elif action == "pickup":
+            # Deterministic, seq-keyed item: replaying the same (pid, seq)
+            # add never yields a second item, so exactly-once is world-level.
+            item_id = f"item-{pid}-{seq}"
+            bag = self.inventory.setdefault(pid, [])
+            if item_id not in bag:
+                bag.append(item_id)
+                self.items_created += 1
 
     def step(self) -> None:
         self.tick += 1
@@ -114,6 +128,8 @@ class World:
             "button": copy.deepcopy(self.button),
             "gear": copy.deepcopy(self.gear),
             "press_count": self.press_count,
+            "inventory": copy.deepcopy(self.inventory),
+            "items_created": self.items_created,
         }
 
     @classmethod
@@ -127,6 +143,8 @@ class World:
         w.button = copy.deepcopy(snap["button"])
         w.gear = copy.deepcopy(snap["gear"])
         w.press_count = snap["press_count"]
+        w.inventory = copy.deepcopy(snap.get("inventory", {}))
+        w.items_created = snap.get("items_created", 0)
         return w
 
     def entity_ids(self) -> list[str]:

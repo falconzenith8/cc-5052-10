@@ -286,6 +286,141 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(e["kind"] == "error" for e in host.events),
                         "failure was not reported back to the kernel/UI")
 
+    # -- staged handoff: candidate drops after loading the snapshot ---------
+
+    async def test_candidate_drops_after_load_next_takes_over(self):
+        """n1 loads the snapshot then disconnects before becoming host; the
+        handoff falls to n2. n1's late completion callback must be ignored."""
+        self.c = Cluster(3)
+        await self.c.start()
+        host = self.c.host()          # n0
+        n1, n2 = self.c.nodes["n1"], self.c.nodes["n2"]
+        n1.post_load_delay = 0.5
+
+        task = asyncio.create_task(host.start_handoff("revocable_log"))
+        ok = await wait_until(lambda: n1.phase == "snapshot_loaded", 2)
+        self.assertTrue(ok, "n1 never loaded the snapshot")
+        attempt_id = host._handoff["id"]
+
+        n1._stopped = True            # candidate disappears after the load
+        await n1.transport.crash()
+        res = await asyncio.wait_for(task, 5)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["candidate"], "n2")
+
+        ok = await wait_until(
+            lambda: n2.role == "host" and n2._migration_report
+            and n2._migration_report["complete"], 4)
+        self.assertTrue(ok, "n2 did not complete the fallback handoff")
+        self.assertEqual(host._handoff["rejected"], ["n1"])
+        self.assertEqual(host._handoff["stage"], "submit_inputs")
+
+        # The dropped candidate's completion callback arrives afterwards.
+        # It must not be credited to the live handoff.
+        host._on_migrate_ack("n1", {"type": "migrate_ack", "epoch": 1,
+                                    "attempt": attempt_id, "stage": "loaded"})
+        self.assertTrue(any("stale completion callback" in e["msg"]
+                            for e in host.events))
+        self.assertEqual(n2.role, "host")
+
+    async def test_frozen_once_publishes_single_snapshot(self):
+        """frozen_once never republishes to a second candidate."""
+        self.c = Cluster(3)
+        await self.c.start()
+        host = self.c.host()
+        n1 = self.c.nodes["n1"]
+        n1.post_load_delay = 0.5
+
+        task = asyncio.create_task(host.start_handoff("frozen_once"))
+        ok = await wait_until(lambda: n1.phase == "snapshot_loaded", 2)
+        self.assertTrue(ok)
+        n1._stopped = True
+        await n1.transport.crash()
+        res = await asyncio.wait_for(task, 5)
+        self.assertFalse(res["ok"], "frozen_once should abort, not republish")
+        self.assertEqual(host.publish_count, 1)
+        self.assertEqual(host._handoff["publish_count"], 1)
+        self.assertNotIn("n2", host._handoff["rejected"])
+        # old host resumed normally and keeps serving
+        self.assertTrue(host._sealed is False)
+        self.assertEqual(host.phase, "hosting")
+
+    # -- the replay scenario: two takeovers + one voluntary exit ------------
+
+    async def test_two_takeovers_one_exit_inventory_boundary(self):
+        self.c = Cluster(3)
+        await self.c.start()
+        n0, n1, n2 = (self.c.nodes[k] for k in ("n0", "n1", "n2"))
+
+        async def until(pred, t=4):
+            ok = await wait_until(pred, t)
+            self.assertTrue(ok)
+
+        # Step 1: n1 picks up one item; the running host applies it.
+        n1.submit_input("pickup")
+        await until(lambda: n0.world.items_created == 1)
+        self.assertEqual(n0.world.inventory["n1"], ["item-n1-1"])
+
+        # Straddle the first handoff: the old host accepts a bag op for
+        # itself but the simulator never applies/broadcasts it before the
+        # boundary seals. It is accepted-but-unconfirmed.
+        n0.submit_input("pickup")            # n0 seq 1, sits in pending
+        res = await n0.start_handoff("revocable_log")
+        self.assertTrue(res["ok"], res)
+        old_view = n0.ui_state()["handoff"]
+        self.assertEqual(old_view["stage"], "submit_inputs")
+        stages = [s["stage"] for s in old_view["steps"]]
+        self.assertEqual(stages[0], "select_candidate")
+        self.assertIn("load_snapshot", stages)
+        self.assertEqual(stages[-1], "submit_inputs")
+        self.assertEqual(old_view["confirmed"].get("n1"), 1)
+        self.assertEqual([(u["cid"], u["seq"]) for u in old_view["unconfirmed"]],
+                         [("n0", 1)])
+
+        h1 = n1
+        await until(lambda: h1.role == "host" and h1._migration_report
+                    and h1._migration_report["complete"])
+        # The migrated step executed; the departing host's own resend of the
+        # same step is dropped as a duplicate. Exactly one item enters.
+        await until(lambda: h1.world.items_created == 2)
+        self.assertEqual(h1.world.inventory["n0"], ["item-n0-1"])
+        rec = [e for e in h1.input_log if e["cid"] == "n0" and e["seq"] == 1]
+        self.assertTrue(any(e["source"] == "migrated" and e["status"] == "applied"
+                            for e in rec), rec)
+        self.assertTrue(any(e["status"] == "dropped_duplicate"
+                            and e["source"] == "client_resend" for e in rec),
+                        "the resent migrated step was not deduplicated")
+
+        # Step 2: another pickup, then a crash takeover to n2. The step must
+        # be inside a verified checkpoint first, since crash takeover resumes
+        # from the last checkpoint rather than inventing later state.
+        n1.submit_input("pickup")            # n1 seq 2, applied on n1
+        await until(lambda: h1.world.items_created == 3)
+        await until(lambda: n2.last_checkpoint is not None
+                    and n2.last_checkpoint["snapshot"].get("items_created") == 3)
+        await h1.simulate_crash()
+        await until(lambda: n2.role == "host" and n2._migration_report
+                    and n2._migration_report["complete"])
+        h2 = n2
+        self.assertEqual(h2.world.items_created, 3)
+        self.assertIn("item-n1-2", h2.world.inventory["n1"])
+
+        # Step 3: voluntary exit of n2 -> n0 (the only remaining candidate).
+        exit_res = await n2.voluntary_exit("revocable_log")
+        self.assertTrue(exit_res["ok"], exit_res)
+        await until(lambda: n0.role == "host" and n0._migration_report
+                    and n0._migration_report["complete"])
+
+        # Ownership survived every switch; the straddling op is one item.
+        self.assertEqual(n0.world.items_created, 3)
+        self.assertEqual(n0.world.inventory["n0"], ["item-n0-1"])
+        self.assertEqual(n0.world.inventory["n1"], ["item-n1-1", "item-n1-2"])
+        # The audit log survived every takeover and attributes each step.
+        self.assertGreaterEqual(len({e["epoch"] for e in n0.input_log}), 2)
+        applied = [e for e in n0.input_log
+                   if e["cid"] == "n1" and e["status"] == "applied"]
+        self.assertEqual(sorted({e["seq"] for e in applied}), [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()
